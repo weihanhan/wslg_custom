@@ -10,7 +10,7 @@ WSLG 自用修改版
    ```ini
    # 配置示例，改成自己的镜像路径
    [wsl2]
-   systemDistro=C:\\wslg_custom\\wslg_x11RDP_window_enhance_v1.vhd
+   systemDistro=C:\\wslg_custom\\wslg_v1.0.71_fix1.0.vhd
    ```
 
 ## 改动说明
@@ -24,6 +24,10 @@ WSLG 自用修改版
 - `Alt+鼠标左键` 拖动调整窗口大小。
 - `Alt+鼠标右键` 拖动移动窗口。
 - 支持从 Windows 剪贴板粘贴图片到 WSLg 窗口。
+
+## 开发
+
+如果你想自己修改编译 WSLG，可以参考 [WSLG 构建文档](https://github.com/microsoft/wslg/blob/main/CONTRIBUTING.md#build-instructions)
 
 ## 参考
 
