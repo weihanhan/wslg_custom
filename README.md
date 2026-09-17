@@ -29,6 +29,18 @@ WSLG 自用修改版
 
 如果你想自己修改编译 WSLG，可以参考 [WSLG 构建文档](https://github.com/microsoft/wslg/blob/main/CONTRIBUTING.md#build-instructions)
 
+## 源码
+
+WSLG 基线版本 v1.0.71，基于以下仓库分支构建
+- wslg: tags/v1.0.71
+- weston : 2318feca
+- FreeRDP : c4030980
+- pulseaudio : 6f045ff0
+- DirectX-Headers-1.0 : tags/v1.608.0
+- mesa : tags/mesa-23.1.0
+
+补丁文件 `patch-files/weston/base-2318feca.patch`，在 weston 仓库中使用。
+
 ## 参考
 
 - https://github.com/qq1038765585/wslg_title_bar_beautify
