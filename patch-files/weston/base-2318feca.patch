@@ -1,0 +1,2032 @@
+Subject: [PATCH] 大文本粘贴优化
+增强：支持从 Windows 剪贴板粘贴图片到 WSLG
+修复 bug：IDEA `Find in Files` 等反复 map/unmap 的 X11 child window 偶发出现在 `(0,0)`，进入鼠标无法点击/无法拖动状态
+修复：剪贴板服务断言失败退出导致 WSLg 闪退
+修复 Electron/VSCode 等 X11 无装饰窗口最大化后窗口位置偏移的 bug
+增强 WSLg X11/Xwayland 应用窗口的功能： - X11 窗口默认启动时显示 Weston 自绘顶部标题栏。 - 自绘装饰仅保留顶部标题栏，左、右、下边框和阴影均为 0。 - `Alt+F12` 在“仅顶部标题栏模式”和“完全无边框模式”之间切换。 - `Alt+F11` 在窗口化和最大化之间切换。 - `Alt+鼠标左键` 调整窗口大小。 - `Alt+鼠标右键` 移动窗口。 - 点击标题栏左上角窗口图标切换当前窗口深色/浅色主题。 - 标题栏按钮使用 `vendor/weston/data/custom_icon` 下的 PNG 图标。 - 右侧最小化、最大化、关闭按钮不绘制白色矩形背景，只保留 PNG 图标和透明点击区域。 - Xwayland RAIL 窗口使用无 Windows 原生 caption/thickframe 的 RAIL style，以避免 Windows 侧白边和原生边框。
+---
+Index: data/meson.build
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/data/meson.build b/data/meson.build
+--- a/data/meson.build	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/data/meson.build	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -27,3 +27,19 @@
+ 	],
+ 	install_dir: join_paths(dir_data, 'weston')
+ )
++
++install_data(
++	[
++		'custom_icon/close_black.png',
++		'custom_icon/close_white.png',
++		'custom_icon/maximize_black.png',
++		'custom_icon/maximize_white.png',
++		'custom_icon/minimize_black.png',
++		'custom_icon/minimize_white.png',
++		'custom_icon/revert_black.png',
++		'custom_icon/revert_white.png',
++		'custom_icon/window_black.png',
++		'custom_icon/window_white.png',
++	],
++	install_dir: join_paths(dir_data, 'weston', 'custom_icon')
++)
+Index: include/libweston/xwayland-api.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/include/libweston/xwayland-api.h b/include/libweston/xwayland-api.h
+--- a/include/libweston/xwayland-api.h	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/include/libweston/xwayland-api.h	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -30,6 +30,7 @@
+ extern "C" {
+ #endif
+ 
++#include <stdbool.h>
+ #include <unistd.h>
+ 
+ #include <libweston/plugin-registry.h>
+@@ -177,6 +178,25 @@
+ 	 */
+ 	void
+ 	(*close_window)(struct weston_surface *surface);
++	/** Check whether the Xwayland server-side decoration is borderless.
++	 *
++	 * \param surface The Xwayland surface.
++	 */
++	bool
++	(*get_borderless)(struct weston_surface *surface);
++	/** Set the Xwayland server-side decoration borderless state.
++	 *
++	 * \param surface The Xwayland surface.
++	 * \param borderless Whether to hide all server-side decoration.
++	 */
++	void
++	(*set_borderless)(struct weston_surface *surface, bool borderless);
++	/** Toggle the Xwayland server-side decoration borderless state.
++	 *
++	 * \param surface The Xwayland surface.
++	 */
++	void
++	(*toggle_borderless)(struct weston_surface *surface);
+ };
+ 
+ /** Retrieve the API object for the libweston Xwayland surface.
+Index: libweston/backend-rdp/rdprail.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/libweston/backend-rdp/rdprail.c b/libweston/backend-rdp/rdprail.c
+--- a/libweston/backend-rdp/rdprail.c	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/libweston/backend-rdp/rdprail.c	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -46,6 +46,7 @@
+ 
+ #include "libweston-internal.h"
+ #include "shared/xalloc.h"
++#include <libweston/xwayland-api.h>
+ 
+ #define RAIL_WINDOW_FULLSCREEN_STYLE (WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_GROUP | WS_TABSTOP)
+ #define RAIL_WINDOW_NORMAL_STYLE (RAIL_WINDOW_FULLSCREEN_STYLE | WS_THICKFRAME | WS_CAPTION)
+@@ -59,6 +60,30 @@
+ static void rdp_rail_schedule_update_window(struct wl_listener *listener, void *data);
+ static void rdp_rail_dump_window_label(struct weston_surface *surface, char *label, uint32_t label_size);
+ 
++static bool
++rdp_rail_surface_is_xwayland(struct weston_surface *surface)
++{
++	const struct weston_xwayland_surface_api *api;
++
++	if (!surface)
++		return false;
++
++	api = weston_xwayland_surface_get_api(surface->compositor);
++	if (!api || !api->is_xwayland_surface)
++		return false;
++
++	return api->is_xwayland_surface(surface);
++}
++
++static UINT32
++rdp_rail_window_style_for_surface(struct weston_surface *surface)
++{
++	if (rdp_rail_surface_is_xwayland(surface))
++		return RAIL_WINDOW_FULLSCREEN_STYLE;
++
++	return RAIL_WINDOW_NORMAL_STYLE;
++}
++
+ struct lang_GUID {
+ 	uint32_t Data1;
+ 	uint16_t Data2;
+@@ -1658,7 +1683,7 @@
+ 	window_order_info.windowId = window_id;
+ 
+ 	window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_STYLE;
+-	window_state_order.style = RAIL_WINDOW_NORMAL_STYLE;
++	window_state_order.style = rdp_rail_window_style_for_surface(surface);
+ 	window_state_order.extendedStyle = WS_EX_LAYERED;
+ 
+ 	window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_OWNER;
+@@ -2233,10 +2258,11 @@
+ 					  window_id,
+ 					  rdp_showstate_to_string(rail_state->showState),
+ 					  rdp_showstate_to_string(rail_state->showState_requested));
+-			/* if exiting fullscreen, restore window style to normal style */
++			/* if exiting fullscreen, restore window style */
+ 			if (rail_state->showState == RDP_WINDOW_SHOW_FULLSCREEN) {
+ 				window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_STYLE;
+-				window_state_order.style = RAIL_WINDOW_NORMAL_STYLE;
++				window_state_order.style =
++					rdp_rail_window_style_for_surface(surface);
+ 				window_state_order.extendedStyle = WS_EX_LAYERED;
+ 				/* force update window geometry */
+ 				rail_state->forceUpdateWindowState = true;
+Index: rdprail-shell/shell.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/rdprail-shell/shell.c b/rdprail-shell/shell.c
+--- a/rdprail-shell/shell.c	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/rdprail-shell/shell.c	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -49,6 +49,7 @@
+ #include <libweston/libweston.h>
+ #include <libweston/backend.h>
+ #include <libweston/backend-rdp.h>
++#include <libweston/xwayland-api.h>
+ 
+ struct focus_state {
+ 	struct desktop_shell *shell;
+@@ -3576,10 +3577,129 @@
+ 	else
+ 		edges |= WL_SHELL_SURFACE_RESIZE_BOTTOM;
+ 
++	if (edges == WL_SHELL_SURFACE_RESIZE_NONE) {
++		int32_t right = surface->width - x;
++		int32_t bottom = surface->height - y;
++		int32_t nearest = x;
++
++		edges = WL_SHELL_SURFACE_RESIZE_LEFT;
++		if (right < nearest) {
++			nearest = right;
++			edges = WL_SHELL_SURFACE_RESIZE_RIGHT;
++		}
++		if (y < nearest) {
++			nearest = y;
++			edges = WL_SHELL_SURFACE_RESIZE_TOP;
++		}
++		if (bottom < nearest)
++			edges = WL_SHELL_SURFACE_RESIZE_BOTTOM;
++	}
++
+ 	shell_rdp_debug_verbose(shsurf->shell, "%s edges:%x\n", __func__, edges);
+ 	surface_resize(shsurf, pointer, edges);
+ }
+ 
++static bool
++surface_is_xwayland(struct weston_surface *surface)
++{
++	const struct weston_xwayland_surface_api *api;
++
++	if (!surface)
++		return false;
++
++	api = weston_xwayland_surface_get_api(surface->compositor);
++	if (!api || !api->is_xwayland_surface)
++		return false;
++
++	return api->is_xwayland_surface(surface);
++}
++
++static struct shell_surface *
++get_focused_xwayland_shell_surface(struct weston_surface *focus,
++				   struct weston_surface **main_surface)
++{
++	struct weston_surface *surface;
++
++	if (!focus)
++		return NULL;
++
++	surface = weston_surface_get_main_surface(focus);
++	if (!surface || !surface_is_xwayland(surface))
++		return NULL;
++
++	if (main_surface)
++		*main_surface = surface;
++
++	return get_shell_surface(surface);
++}
++
++static void
++xwayland_resize_binding(struct weston_pointer *pointer,
++			const struct timespec *time,
++			uint32_t button, void *data)
++{
++	if (!pointer->focus ||
++	    !get_focused_xwayland_shell_surface(pointer->focus->surface, NULL))
++		return;
++
++	resize_binding(pointer, time, button, data);
++}
++
++static void
++xwayland_move_binding(struct weston_pointer *pointer,
++		      const struct timespec *time,
++		      uint32_t button, void *data)
++{
++	if (!pointer->focus ||
++	    !get_focused_xwayland_shell_surface(pointer->focus->surface, NULL))
++		return;
++
++	move_binding(pointer, time, button, data);
++}
++
++static void
++xwayland_maximize_binding(struct weston_keyboard *keyboard,
++			  const struct timespec *time,
++			  uint32_t key, void *data)
++{
++	const struct weston_xwayland_surface_api *api;
++	struct weston_surface *surface = NULL;
++	struct shell_surface *shsurf;
++
++	shsurf = get_focused_xwayland_shell_surface(keyboard->focus, &surface);
++	if (!shsurf)
++		return;
++
++	api = weston_xwayland_surface_get_api(surface->compositor);
++	if (!api || !api->set_maximized)
++		return;
++
++	shell_rdp_debug_verbose(shsurf->shell, "%s\n", __func__);
++	api->set_maximized(surface,
++			   !weston_desktop_surface_get_maximized(shsurf->desktop_surface));
++}
++
++static void
++xwayland_toggle_borderless_binding(struct weston_keyboard *keyboard,
++				   const struct timespec *time,
++				   uint32_t key, void *data)
++{
++	const struct weston_xwayland_surface_api *api;
++	struct weston_surface *surface = NULL;
++	struct shell_surface *shsurf;
++
++	shsurf = get_focused_xwayland_shell_surface(keyboard->focus, &surface);
++	if (!shsurf)
++		return;
++
++	api = weston_xwayland_surface_get_api(surface->compositor);
++	if (!api || !api->toggle_borderless)
++		return;
++
++	shell_rdp_debug_verbose(shsurf->shell, "%s\n", __func__);
++	api->toggle_borderless(surface);
++}
++
+ static void
+ surface_opacity_binding(struct weston_pointer *pointer,
+ 			const struct timespec *time,
+@@ -4609,6 +4729,16 @@
+ 	weston_compositor_add_touch_binding(ec, 0,
+ 					    touch_to_activate_binding,
+ 					    shell);
++
++	weston_compositor_add_key_binding(ec, KEY_F11, MODIFIER_ALT,
++					  xwayland_maximize_binding, shell);
++	weston_compositor_add_key_binding(ec, KEY_F12, MODIFIER_ALT,
++					  xwayland_toggle_borderless_binding,
++					  shell);
++	weston_compositor_add_button_binding(ec, BTN_LEFT, MODIFIER_ALT,
++					     xwayland_resize_binding, shell);
++	weston_compositor_add_button_binding(ec, BTN_RIGHT, MODIFIER_ALT,
++					     xwayland_move_binding, shell);
+ 
+ 	mod = shell->binding_modifier;
+ 	if (!mod)
+@@ -4622,11 +4752,13 @@
+ 					  maximize_binding, NULL);
+ 	weston_compositor_add_key_binding(ec, KEY_F, mod | MODIFIER_SHIFT,
+ 					  fullscreen_binding, NULL);
+-	weston_compositor_add_button_binding(ec, BTN_LEFT, mod, move_binding,
+-					     shell);
++	if (mod != MODIFIER_ALT)
++		weston_compositor_add_button_binding(ec, BTN_LEFT, mod,
++						     move_binding, shell);
+ 	weston_compositor_add_touch_binding(ec, mod, touch_move_binding, shell);
+-	weston_compositor_add_button_binding(ec, BTN_RIGHT, mod,
+-					     resize_binding, shell);
++	if (mod != MODIFIER_ALT)
++		weston_compositor_add_button_binding(ec, BTN_RIGHT, mod,
++						     resize_binding, shell);
+ 	weston_compositor_add_button_binding(ec, BTN_LEFT,
+ 					     mod | MODIFIER_SHIFT,
+ 					     resize_binding, shell);
+Index: shared/cairo-util.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/shared/cairo-util.c b/shared/cairo-util.c
+--- a/shared/cairo-util.c	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/shared/cairo-util.c	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -496,12 +496,34 @@
+ 	cairo_surface_t *source;
+ 	int x, y, margin, top_margin;
+ 	int text_width, text_height;
++	bool titlebar_only = flags & THEME_FRAME_TITLEBAR_ONLY;
++	bool dark = flags & THEME_FRAME_DARK;
+ 
+ 	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+ 	cairo_set_source_rgba(cr, 0, 0, 0, 0);
+ 	cairo_paint(cr);
+ 
+-	if (flags & THEME_FRAME_MAXIMIZED)
++	if (flags & THEME_FRAME_BORDERLESS)
++		return;
++
++	if (titlebar_only) {
++		margin = 0;
++		top_margin = t->titlebar_height;
++		cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
++		if (dark) {
++			if (flags & THEME_FRAME_ACTIVE)
++				cairo_set_source_rgba(cr, 0.10, 0.11, 0.13, 1);
++			else
++				cairo_set_source_rgba(cr, 0.15, 0.16, 0.18, 1);
++		} else {
++			if (flags & THEME_FRAME_ACTIVE)
++				cairo_set_source_rgba(cr, 0.93, 0.94, 0.95, 1);
++			else
++				cairo_set_source_rgba(cr, 0.86, 0.87, 0.88, 1);
++		}
++		cairo_rectangle(cr, 0, 0, width, top_margin);
++		cairo_fill(cr);
++	} else if (flags & THEME_FRAME_MAXIMIZED)
+ 		margin = 0;
+ 	else {
+ 		render_shadow(cr, t->shadow,
+@@ -515,15 +537,17 @@
+ 	else
+ 		source = t->inactive_frame;
+ 
+-	if (title || !wl_list_empty(buttons))
+-		top_margin = t->titlebar_height;
+-	else
+-		top_margin = t->width;
++	if (!titlebar_only) {
++		if (title || !wl_list_empty(buttons))
++			top_margin = t->titlebar_height;
++		else
++			top_margin = t->width;
+ 
+-	tile_source(cr, source,
+-		    margin, margin,
+-		    width - margin * 2, height - margin * 2,
+-		    t->width, top_margin);
++		tile_source(cr, source,
++			    margin, margin,
++			    width - margin * 2, height - margin * 2,
++			    t->width, top_margin);
++	}
+ 
+ 	if (title || !wl_list_empty(buttons)) {
+ 
+@@ -565,7 +589,14 @@
+ 		else if (x + text_width > (title_rect->x + title_rect->width))
+ 			x = (title_rect->x + title_rect->width) - text_width;
+ 
+-		if (flags & THEME_FRAME_ACTIVE) {
++		if (titlebar_only) {
++			cairo_move_to(cr, x, y);
++			if (dark)
++				cairo_set_source_rgb(cr, 0.94, 0.95, 0.96);
++			else
++				cairo_set_source_rgb(cr, 0.08, 0.09, 0.10);
++			SHOW_TEXT(cr);
++		} else if (flags & THEME_FRAME_ACTIVE) {
+ 			cairo_move_to(cr, x + 1, y  + 1);
+ 			cairo_set_source_rgb(cr, 1, 1, 1);
+ 			SHOW_TEXT(cr);
+@@ -587,6 +618,22 @@
+ 	int vlocation, hlocation, location;
+ 	int margin, top_margin, grip_size;
+ 
++	if (flags & THEME_FRAME_BORDERLESS) {
++		if (x < 0 || y < 0 || x >= width || y >= height)
++			return THEME_LOCATION_EXTERIOR;
++
++		return THEME_LOCATION_CLIENT_AREA;
++	}
++
++	if (flags & THEME_FRAME_TITLEBAR_ONLY) {
++		if (x < 0 || y < 0 || x >= width || y >= height)
++			return THEME_LOCATION_EXTERIOR;
++		if (y < t->titlebar_height)
++			return THEME_LOCATION_TITLEBAR;
++
++		return THEME_LOCATION_CLIENT_AREA;
++	}
++
+ 	if (flags & THEME_FRAME_MAXIMIZED) {
+ 		margin = 0;
+ 		grip_size = 0;
+Index: shared/cairo-util.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/shared/cairo-util.h b/shared/cairo-util.h
+--- a/shared/cairo-util.h	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/shared/cairo-util.h	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -27,6 +27,7 @@
+ #define _CAIRO_UTIL_H
+ 
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <cairo.h>
+ 
+ #include <wayland-client.h>
+@@ -67,7 +68,10 @@
+ enum {
+ 	THEME_FRAME_ACTIVE = 1,
+ 	THEME_FRAME_MAXIMIZED = 2,
+-	THEME_FRAME_NO_TITLE = 4
++	THEME_FRAME_NO_TITLE = 4,
++	THEME_FRAME_BORDERLESS = 8,
++	THEME_FRAME_TITLEBAR_ONLY = 16,
++	THEME_FRAME_DARK = 32
+ };
+ 
+ void
+@@ -108,12 +112,17 @@
+ 	FRAME_STATUS_MENU = 0x10,
+ 	FRAME_STATUS_RESIZE = 0x20,
+ 	FRAME_STATUS_MOVE = 0x40,
+-	FRAME_STATUS_ALL = 0x7f
++	FRAME_STATUS_THEME = 0x80,
++	FRAME_STATUS_ALL = 0xff
+ };
+ 
+ enum frame_flag {
+ 	FRAME_FLAG_ACTIVE = 0x1,
+-	FRAME_FLAG_MAXIMIZED = 0x2
++	FRAME_FLAG_MAXIMIZED = 0x2,
++	FRAME_FLAG_BORDERLESS = 0x4,
++	FRAME_FLAG_DARK = 0x8,
++	FRAME_FLAG_TITLEBAR_ONLY = 0x10,
++	FRAME_FLAG_MENU_TOGGLES_THEME = 0x20
+ };
+ 
+ enum {
+@@ -147,6 +156,9 @@
+ void
+ frame_unset_flag(struct frame *frame, enum frame_flag flag);
+ 
++bool
++frame_get_flag(struct frame *frame, enum frame_flag flag);
++
+ /* May set FRAME_STATUS_REPAINT */
+ void
+ frame_resize(struct frame *frame, int32_t width, int32_t height);
+Index: shared/frame.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/shared/frame.c b/shared/frame.c
+--- a/shared/frame.c	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/shared/frame.c	(revision 0aa75528f893a7520ad70e0319c92a54d0146471)
+@@ -40,6 +40,15 @@
+ 	FRAME_BUTTON_ALIGN_RIGHT = 0x1,
+ 	FRAME_BUTTON_DECORATED = 0x2,
+ 	FRAME_BUTTON_CLICK_DOWN = 0x4,
++	FRAME_BUTTON_PADDED = 0x8,
++};
++
++enum frame_button_type {
++	FRAME_BUTTON_TYPE_CUSTOM,
++	FRAME_BUTTON_TYPE_WINDOW,
++	FRAME_BUTTON_TYPE_CLOSE,
++	FRAME_BUTTON_TYPE_MAXIMIZE,
++	FRAME_BUTTON_TYPE_MINIMIZE,
+ };
+ 
+ struct frame_button {
+@@ -48,6 +57,7 @@
+ 
+ 	cairo_surface_t *icon;
+ 	enum frame_button_flags flags;
++	enum frame_button_type type;
+ 	int hover_count;
+ 	int press_count;
+ 
+@@ -111,7 +121,8 @@
+ static struct frame_button *
+ frame_button_create_from_surface(struct frame *frame, cairo_surface_t *icon,
+                                  enum frame_status status_effect,
+-                                 enum frame_button_flags flags)
++                                 enum frame_button_flags flags,
++                                 enum frame_button_type type)
+ {
+ 	struct frame_button *button;
+ 
+@@ -122,6 +133,7 @@
+ 	button->icon = icon;
+ 	button->frame = frame;
+ 	button->flags = flags;
++	button->type = type;
+ 	button->status_effect = status_effect;
+ 
+ 	wl_list_insert(frame->buttons.prev, &button->link);
+@@ -132,7 +144,8 @@
+ static struct frame_button *
+ frame_button_create(struct frame *frame, const char *icon_name,
+                     enum frame_status status_effect,
+-                    enum frame_button_flags flags)
++                    enum frame_button_flags flags,
++                    enum frame_button_type type)
+ {
+ 	struct frame_button *button;
+ 	cairo_surface_t *icon;
+@@ -142,7 +155,7 @@
+ 		goto error;
+ 
+ 	button = frame_button_create_from_surface(frame, icon, status_effect,
+-	                                          flags);
++	                                          flags, type);
+ 	if (!button)
+ 		goto error;
+ 
+@@ -152,6 +165,78 @@
+ 	cairo_surface_destroy(icon);
+ 	return NULL;
+ }
++
++static const char *
++frame_button_icon_basename(struct frame_button *button)
++{
++	bool dark = button->frame->flags & FRAME_FLAG_DARK;
++	bool maximized = button->frame->flags & FRAME_FLAG_MAXIMIZED;
++
++	switch (button->type) {
++	case FRAME_BUTTON_TYPE_WINDOW:
++		return dark ? "custom_icon/window_white.png" :
++			      "custom_icon/window_black.png";
++	case FRAME_BUTTON_TYPE_CLOSE:
++		return dark ? "custom_icon/close_white.png" :
++			      "custom_icon/close_black.png";
++	case FRAME_BUTTON_TYPE_MAXIMIZE:
++		if (maximized)
++			return dark ? "custom_icon/revert_white.png" :
++				      "custom_icon/revert_black.png";
++
++		return dark ? "custom_icon/maximize_white.png" :
++			      "custom_icon/maximize_black.png";
++	case FRAME_BUTTON_TYPE_MINIMIZE:
++		return dark ? "custom_icon/minimize_white.png" :
++			      "custom_icon/minimize_black.png";
++	case FRAME_BUTTON_TYPE_CUSTOM:
++	default:
++		return NULL;
++	}
++}
++
++static int
++frame_button_update_icon(struct frame_button *button)
++{
++	cairo_surface_t *icon;
++	char *name;
++	const char *basename;
++
++	basename = frame_button_icon_basename(button);
++	if (!basename)
++		return 0;
++
++	name = file_name_with_datadir(basename);
++	if (!name)
++		return -1;
++
++	icon = cairo_image_surface_create_from_png(name);
++	free(name);
++
++	if (cairo_surface_status(icon) != CAIRO_STATUS_SUCCESS) {
++		cairo_surface_destroy(icon);
++		return -1;
++	}
++
++	if (button->icon)
++		cairo_surface_destroy(button->icon);
++	button->icon = icon;
++
++	return 0;
++}
++
++static void
++frame_update_button_icons(struct frame *frame)
++{
++	struct frame_button *button;
++
++	wl_list_for_each(button, &frame->buttons, link) {
++		if (frame_button_update_icon(button) == 0)
++			frame->geometry_dirty = 1;
++	}
++
++	frame->status |= FRAME_STATUS_REPAINT;
++}
+ 
+ static void
+ frame_button_destroy(struct frame_button *button)
+@@ -183,8 +268,13 @@
+ 		button->frame->status |= FRAME_STATUS_REPAINT;
+ 	button->press_count++;
+ 
+-	if (button->flags & FRAME_BUTTON_CLICK_DOWN)
+-		button->frame->status |= button->status_effect;
++	if (button->flags & FRAME_BUTTON_CLICK_DOWN) {
++		if (button->status_effect == FRAME_STATUS_MENU &&
++		    (button->frame->flags & FRAME_FLAG_MENU_TOGGLES_THEME))
++			button->frame->status |= FRAME_STATUS_THEME;
++		else
++			button->frame->status |= button->status_effect;
++	}
+ }
+ 
+ static void
+@@ -196,8 +286,13 @@
+ 
+ 	button->frame->status |= FRAME_STATUS_REPAINT;
+ 
+-	if (!(button->flags & FRAME_BUTTON_CLICK_DOWN))
+-		button->frame->status |= button->status_effect;
++	if (!(button->flags & FRAME_BUTTON_CLICK_DOWN)) {
++		if (button->status_effect == FRAME_STATUS_MENU &&
++		    (button->frame->flags & FRAME_FLAG_MENU_TOGGLES_THEME))
++			button->frame->status |= FRAME_STATUS_THEME;
++		else
++			button->frame->status |= button->status_effect;
++	}
+ }
+ 
+ static void
+@@ -242,6 +337,8 @@
+ 		cairo_fill (cr);
+ 
+ 		x += 4;
++	} else if (button->flags & FRAME_BUTTON_PADDED) {
++		x += 5;
+ 	}
+ 
+ 	cairo_set_source_surface(cr, button->icon, x, y);
+@@ -356,9 +453,10 @@
+ 			button = frame_button_create_from_surface(frame,
+ 			                                          icon,
+ 			                                          FRAME_STATUS_MENU,
+-			                                          FRAME_BUTTON_CLICK_DOWN);
++			                                          FRAME_BUTTON_CLICK_DOWN,
++			                                          FRAME_BUTTON_TYPE_CUSTOM);
+ 		} else {
+-			char *name = file_name_with_datadir("icon_window.png");
++			char *name = file_name_with_datadir("custom_icon/window_black.png");
+ 
+ 			if (!name)
+ 				goto free_frame;
+@@ -366,7 +464,8 @@
+ 			button = frame_button_create(frame,
+ 			                             name,
+ 			                             FRAME_STATUS_MENU,
+-			                             FRAME_BUTTON_CLICK_DOWN);
++			                             FRAME_BUTTON_CLICK_DOWN,
++			                             FRAME_BUTTON_TYPE_WINDOW);
+ 			free(name);
+ 		}
+ 		if (!button)
+@@ -374,7 +473,7 @@
+ 	}
+ 
+ 	if (buttons & FRAME_BUTTON_CLOSE) {
+-		char *name = file_name_with_datadir("sign_close.png");
++		char *name = file_name_with_datadir("custom_icon/close_black.png");
+ 
+ 		if (!name)
+ 			goto free_frame;
+@@ -383,14 +482,15 @@
+ 					     name,
+ 					     FRAME_STATUS_CLOSE,
+ 					     FRAME_BUTTON_ALIGN_RIGHT |
+-					     FRAME_BUTTON_DECORATED);
++					     FRAME_BUTTON_PADDED,
++					     FRAME_BUTTON_TYPE_CLOSE);
+ 		free(name);
+ 		if (!button)
+ 			goto free_frame;
+ 	}
+ 
+ 	if (buttons & FRAME_BUTTON_MAXIMIZE) {
+-		char *name = file_name_with_datadir("sign_maximize.png");
++		char *name = file_name_with_datadir("custom_icon/maximize_black.png");
+ 
+ 		if (!name)
+ 			goto free_frame;
+@@ -399,14 +499,15 @@
+ 					     name,
+ 					     FRAME_STATUS_MAXIMIZE,
+ 					     FRAME_BUTTON_ALIGN_RIGHT |
+-					     FRAME_BUTTON_DECORATED);
++					     FRAME_BUTTON_PADDED,
++					     FRAME_BUTTON_TYPE_MAXIMIZE);
+ 		free(name);
+ 		if (!button)
+ 			goto free_frame;
+ 	}
+ 
+ 	if (buttons & FRAME_BUTTON_MINIMIZE) {
+-		char *name = file_name_with_datadir("sign_minimize.png");
++		char *name = file_name_with_datadir("custom_icon/minimize_black.png");
+ 
+ 		if (!name)
+ 			goto free_frame;
+@@ -415,7 +516,8 @@
+ 					     name,
+ 					     FRAME_STATUS_MINIMIZE,
+ 					     FRAME_BUTTON_ALIGN_RIGHT |
+-					     FRAME_BUTTON_DECORATED);
++					     FRAME_BUTTON_PADDED,
++					     FRAME_BUTTON_TYPE_MINIMIZE);
+ 		free(name);
+ 		if (!button)
+ 			goto free_frame;
+@@ -465,23 +567,47 @@
+ void
+ frame_set_flag(struct frame *frame, enum frame_flag flag)
+ {
+-	if (flag & FRAME_FLAG_MAXIMIZED && !(frame->flags & FRAME_FLAG_MAXIMIZED))
++	uint32_t old_flags = frame->flags;
++
++	if ((flag & (FRAME_FLAG_MAXIMIZED |
++		     FRAME_FLAG_BORDERLESS |
++		     FRAME_FLAG_TITLEBAR_ONLY)) &&
++	    (old_flags & flag) != flag)
+ 		frame->geometry_dirty = 1;
+ 
+ 	frame->flags |= flag;
++	if ((old_flags ^ frame->flags) & (FRAME_FLAG_DARK |
++					  FRAME_FLAG_MAXIMIZED))
++		frame_update_button_icons(frame);
++
+ 	frame->status |= FRAME_STATUS_REPAINT;
+ }
+ 
+ void
+ frame_unset_flag(struct frame *frame, enum frame_flag flag)
+ {
+-	if (flag & FRAME_FLAG_MAXIMIZED && frame->flags & FRAME_FLAG_MAXIMIZED)
++	uint32_t old_flags = frame->flags;
++
++	if ((flag & (FRAME_FLAG_MAXIMIZED |
++		     FRAME_FLAG_BORDERLESS |
++		     FRAME_FLAG_TITLEBAR_ONLY)) &&
++	    (old_flags & flag))
+ 		frame->geometry_dirty = 1;
+ 
+ 	frame->flags &= ~flag;
++	if ((old_flags ^ frame->flags) & (FRAME_FLAG_DARK |
++					  FRAME_FLAG_MAXIMIZED))
++		frame_update_button_icons(frame);
++
+ 	frame->status |= FRAME_STATUS_REPAINT;
+ }
+ 
++bool
++frame_get_flag(struct frame *frame, enum frame_flag flag)
++{
++	return (frame->flags & flag) == flag;
++}
++
+ void
+ frame_resize(struct frame *frame, int32_t width, int32_t height)
+ {
+@@ -498,6 +624,25 @@
+ {
+ 	struct theme *t = frame->theme;
+ 
++	if (frame->flags & FRAME_FLAG_BORDERLESS) {
++		*top = 0;
++		*bottom = 0;
++		*right = 0;
++		*left = 0;
++		return;
++	}
++
++	if (frame->flags & FRAME_FLAG_TITLEBAR_ONLY) {
++		if (frame->title || !wl_list_empty(&frame->buttons))
++			*top = t->titlebar_height;
++		else
++			*top = 0;
++		*bottom = 0;
++		*right = 0;
++		*left = 0;
++		return;
++	}
++
+ 	/* Top may have a titlebar */
+ 	if (frame->title || !wl_list_empty(&frame->buttons))
+ 		*top = t->titlebar_height;
+@@ -557,7 +702,36 @@
+ 	else
+ 		titlebar_height = t->width;
+ 
+-	if (frame->flags & FRAME_FLAG_MAXIMIZED) {
++	if (frame->flags & FRAME_FLAG_BORDERLESS) {
++		frame->interior.x = 0;
++		frame->interior.y = 0;
++		frame->interior.width = frame->width;
++		frame->interior.height = frame->height;
++		frame->opaque_margin = 0;
++		frame->shadow_margin = 0;
++
++		wl_list_for_each(button, &frame->buttons, link) {
++			button->allocation.x = 0;
++			button->allocation.y = 0;
++			button->allocation.width = 0;
++			button->allocation.height = 0;
++		}
++
++		frame->title_rect.x = 0;
++		frame->title_rect.y = 0;
++		frame->title_rect.width = 0;
++		frame->title_rect.height = 0;
++		frame->geometry_dirty = 0;
++		return;
++	} else if (frame->flags & FRAME_FLAG_TITLEBAR_ONLY) {
++		frame->interior.x = 0;
++		frame->interior.y = titlebar_height;
++		frame->interior.width = frame->width;
++		frame->interior.height = frame->height > titlebar_height ?
++			frame->height - titlebar_height : 0;
++		frame->opaque_margin = 0;
++		frame->shadow_margin = 0;
++	} else if (frame->flags & FRAME_FLAG_MAXIMIZED) {
+ 		decoration_width = t->width * 2;
+ 		decoration_height = t->width + titlebar_height;
+ 
+@@ -581,29 +755,42 @@
+ 		frame->shadow_margin = t->margin;
+ 	}
+ 
+-	x_r = frame->width - t->width - frame->shadow_margin;
+-	x_l = t->width + frame->shadow_margin;
+-	y = t->width + frame->shadow_margin;
++	if (frame->flags & FRAME_FLAG_TITLEBAR_ONLY) {
++		x_r = frame->width;
++		x_l = 4;
++		y = 0;
++	} else {
++		x_r = frame->width - t->width - frame->shadow_margin;
++		x_l = t->width + frame->shadow_margin;
++		y = t->width + frame->shadow_margin;
++	}
+ 	wl_list_for_each(button, &frame->buttons, link) {
+ 		const int button_padding = 4;
++		int icon_y;
++
+ 		w = cairo_image_surface_get_width(button->icon);
+ 		h = cairo_image_surface_get_height(button->icon);
+ 
+-		if (button->flags & FRAME_BUTTON_DECORATED)
++		if (button->flags & (FRAME_BUTTON_DECORATED | FRAME_BUTTON_PADDED))
+ 			w += 10;
+ 
++		if (frame->flags & FRAME_FLAG_TITLEBAR_ONLY)
++			icon_y = (titlebar_height - h) / 2;
++		else
++			icon_y = y;
++
+ 		if (button->flags & FRAME_BUTTON_ALIGN_RIGHT) {
+ 			x_r -= w;
+ 
+ 			button->allocation.x = x_r;
+-			button->allocation.y = y;
++			button->allocation.y = icon_y;
+ 			button->allocation.width = w + 1;
+ 			button->allocation.height = h + 1;
+ 
+ 			x_r -= button_padding;
+ 		} else {
+ 			button->allocation.x = x_l;
+-			button->allocation.y = y;
++			button->allocation.y = icon_y;
+ 			button->allocation.width = w + 1;
+ 			button->allocation.height = h + 1;
+ 
+@@ -676,6 +863,25 @@
+ 	return frame->shadow_margin;
+ }
+ 
++static uint32_t
++frame_get_theme_flags(struct frame *frame)
++{
++	uint32_t flags = 0;
++
++	if (frame->flags & FRAME_FLAG_MAXIMIZED)
++		flags |= THEME_FRAME_MAXIMIZED;
++	if (frame->flags & FRAME_FLAG_ACTIVE)
++		flags |= THEME_FRAME_ACTIVE;
++	if (frame->flags & FRAME_FLAG_BORDERLESS)
++		flags |= THEME_FRAME_BORDERLESS;
++	if (frame->flags & FRAME_FLAG_TITLEBAR_ONLY)
++		flags |= THEME_FRAME_TITLEBAR_ONLY;
++	if (frame->flags & FRAME_FLAG_DARK)
++		flags |= THEME_FRAME_DARK;
++
++	return flags;
++}
++
+ uint32_t
+ frame_status(struct frame *frame)
+ {
+@@ -721,8 +927,7 @@
+ 
+ 	location = theme_get_location(frame->theme, x, y,
+ 				      frame->width, frame->height,
+-				      frame->flags & FRAME_FLAG_MAXIMIZED ?
+-				      THEME_FRAME_MAXIMIZED : 0);
++				      frame_get_theme_flags(frame));
+ 	if (!pointer)
+ 		return location;
+ 
+@@ -841,8 +1046,7 @@
+ 
+ 	location = theme_get_location(frame->theme, pointer->x, pointer->y,
+ 				      frame->width, frame->height,
+-				      frame->flags & FRAME_FLAG_MAXIMIZED ?
+-				      THEME_FRAME_MAXIMIZED : 0);
++				      frame_get_theme_flags(frame));
+ 
+ 	if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+ 		button = malloc(sizeof *button);
+@@ -881,8 +1085,7 @@
+ 
+ 	location = theme_get_location(frame->theme, x, y,
+ 				      frame->width, frame->height,
+-				      frame->flags & FRAME_FLAG_MAXIMIZED ?
+-				      THEME_FRAME_MAXIMIZED : 0);
++				      frame_get_theme_flags(frame));
+ 
+ 	if (id > 0)
+ 		return location;
+@@ -937,8 +1140,7 @@
+ 
+ 	location = theme_get_location(frame->theme, pointer->x, pointer->y,
+ 				      frame->width, frame->height,
+-				      frame->flags & FRAME_FLAG_MAXIMIZED ?
+-				      THEME_FRAME_MAXIMIZED : 0);
++				      frame_get_theme_flags(frame));
+ 
+ 	button = frame_find_button(frame, pointer->x, pointer->y);
+ 
+@@ -974,8 +1176,7 @@
+ 
+ 	location = theme_get_location(frame->theme, x, y,
+ 				      frame->width, frame->height,
+-				      frame->flags & FRAME_FLAG_MAXIMIZED ?
+-				      THEME_FRAME_MAXIMIZED : 0);
++				      frame_get_theme_flags(frame));
+ 
+ 	switch (location) {
+ 	case THEME_LOCATION_TITLEBAR:
+@@ -1011,15 +1212,10 @@
+ frame_repaint(struct frame *frame, cairo_t *cr)
+ {
+ 	struct frame_button *button;
+-	uint32_t flags = 0;
++	uint32_t flags;
+ 
+ 	frame_refresh_geometry(frame);
+-
+-	if (frame->flags & FRAME_FLAG_MAXIMIZED)
+-		flags |= THEME_FRAME_MAXIMIZED;
+-
+-	if (frame->flags & FRAME_FLAG_ACTIVE)
+-		flags |= THEME_FRAME_ACTIVE;
++	flags = frame_get_theme_flags(frame);
+ 
+ 	cairo_save(cr);
+ 	theme_render_frame(frame->theme, cr, frame->width, frame->height,
+@@ -1027,8 +1223,10 @@
+ 			   &frame->buttons, flags);
+ 	cairo_restore(cr);
+ 
+-	wl_list_for_each(button, &frame->buttons, link)
+-		frame_button_repaint(button, cr);
++	if (!(frame->flags & FRAME_FLAG_BORDERLESS)) {
++		wl_list_for_each(button, &frame->buttons, link)
++			frame_button_repaint(button, cr);
++	}
+ 
+ 	frame_status_clear(frame, FRAME_STATUS_REPAINT);
+ }
+Index: xwayland/window-manager.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/xwayland/window-manager.c b/xwayland/window-manager.c
+--- a/xwayland/window-manager.c	(revision 2318fecaeac1f1a2d5a7a042c34d931c71dae04c)
++++ b/xwayland/window-manager.c	(revision 558019a01a393c42d8d6cff836e6aef26dc7c69b)
+@@ -733,6 +733,9 @@
+ 	} else if (window->decorate && window->frame) {
+ 		*width = frame_width(window->frame);
+ 		*height = frame_height(window->frame);
++	} else if (window->frame) {
++		*width = window->width;
++		*height = window->height;
+ 	} else {
+ 		*width = window->width + t->margin * 2;
+ 		*height = window->height + t->margin * 2;
+@@ -750,6 +753,9 @@
+ 		*y = 0;
+ 	} else if (window->decorate && window->frame) {
+ 		frame_interior(window->frame, x, y, NULL, NULL);
++	} else if (window->frame) {
++		*x = 0;
++		*y = 0;
+ 	} else {
+ 		*x = t->margin;
+ 		*y = t->margin;
+@@ -1014,6 +1020,19 @@
+ 	if (!wm_lookup_window(wm, configure_notify->window, &window))
+ 		return;
+ 
++	/* 带 frame 的 X11 窗口会同时用 client window id 和 frame window id
++	 * 指向同一个 weston_wm_window。frame window 的 ConfigureNotify 是
++	 * root 坐标，才是后续 remap 应使用的权威位置；reparent 后的 client
++	 * window ConfigureNotify 是相对 frame 的子窗口偏移，常见为 (0,0)。
++	 * 如果在这里接受该相对坐标，会污染 window->x/y，导致下一次
++	 * MapRequest 把窗口映射到错误的 root 位置。
++	 */
++	if (window->frame && !window->override_redirect && !is_our_resource) {
++		wm_printf(wm, "XCB_CONFIGURE_NOTIFY (window %d) ignored, framed child relative position\n",
++			  configure_notify->window);
++		return;
++	}
++
+ 	window->x = configure_notify->x;
+ 	window->y = configure_notify->y;
+ 	window->pos_dirty = false;
+@@ -1281,6 +1300,10 @@
+ 	if (!window->frame)
+ 		return;
+ 
++	frame_set_flag(window->frame,
++		       FRAME_FLAG_TITLEBAR_ONLY |
++		       FRAME_FLAG_DARK |
++		       FRAME_FLAG_MENU_TOGGLES_THEME);
+ 	frame_resize_inside(window->frame, window->width, window->height);
+ 
+ 	weston_wm_window_get_frame_size(window, &width, &height);
+@@ -1314,6 +1337,12 @@
+ 			  XCB_CW_EVENT_MASK |
+ 			  XCB_CW_COLORMAP, values);
+ 
++	/* Force the first send_position() to configure the frame window.
++	 * The frame starts at SHRT_MIN/SHRT_MIN for non-OR windows, and a
++	 * matching view position would otherwise skip the initial configure. */
++	if (!window->override_redirect)
++		window->pos_dirty = true;
++
+ 	xcb_reparent_window(wm->conn, window->id, window->frame_id, x, y);
+ 
+ 	values[0] = 0;
+@@ -1556,6 +1585,11 @@
+ 	} else if (window->decorate && window->frame) {
+ 		frame_input_rect(window->frame, &input_x, &input_y,
+ 				 &input_w, &input_h);
++	} else if (window->frame) {
++		input_x = 0;
++		input_y = 0;
++		input_w = window->width;
++		input_h = window->height;
+ 	} else {
+ 		input_x = t->margin;
+ 		input_y = t->margin;
+@@ -2494,6 +2528,14 @@
+ 		location = frame_pointer_button(window->frame, NULL,
+ 						button_id, button_state);
+ 
++	if (frame_status(window->frame) & FRAME_STATUS_THEME) {
++		if (frame_get_flag(window->frame, FRAME_FLAG_DARK))
++			frame_unset_flag(window->frame, FRAME_FLAG_DARK);
++		else
++			frame_set_flag(window->frame, FRAME_FLAG_DARK);
++		frame_status_clear(window->frame, FRAME_STATUS_THEME);
++	}
++
+ 	if (frame_status(window->frame) & FRAME_STATUS_REPAINT)
+ 		weston_wm_window_schedule_repaint(window);
+ 
+@@ -2815,6 +2857,8 @@
+ 		{ "WINDOW",		F(atom.window) },
+ 		{ "text/plain;charset=utf-8",	F(atom.text_plain_utf8) },
+ 		{ "text/plain",		F(atom.text_plain) },
++		{ "image/png",		F(atom.image_png) },
++		{ "image/bmp",		F(atom.image_bmp) },
+ 		{ "XdndSelection",	F(atom.xdnd_selection) },
+ 		{ "XdndAware",		F(atom.xdnd_aware) },
+ 		{ "XdndEnter",		F(atom.xdnd_enter) },
+@@ -3122,18 +3166,19 @@
+ {
+ 	struct weston_wm_window *window = get_wm_window(surface);
+ 	struct weston_wm *wm;
+-	struct theme *t;
+ 	int new_width, new_height;
+ 	int vborder, hborder;
++	int32_t top = 0, bottom = 0, left = 0, right = 0;
+ 
+ 	if (!window || !window->wm)
+ 		return;
+ 	wm = window->wm;
+-	t = wm->theme;
+ 
+-	if (window->decorate && !window->fullscreen) {
+-		hborder = 2 * t->width;
+-		vborder = t->titlebar_height + t->width;
++	if (window->decorate && !window->fullscreen && window->frame) {
++		frame_decoration_sizes(window->frame, &top, &bottom,
++				       &left, &right);
++		hborder = left + right;
++		vborder = top + bottom;
+ 	} else {
+ 		hborder = 0;
+ 		vborder = 0;
+@@ -3298,6 +3343,43 @@
+ 	weston_wm_window_close(window, XCB_TIME_CURRENT_TIME);
+ }
+ 
++static bool
++get_borderless(struct weston_surface *surface)
++{
++	struct weston_wm_window *window = get_wm_window(surface);
++
++	if (!window || !window->frame)
++		return true;
++
++	return frame_get_flag(window->frame, FRAME_FLAG_BORDERLESS);
++}
++
++static void
++set_borderless(struct weston_surface *surface, bool borderless)
++{
++	struct weston_wm_window *window = get_wm_window(surface);
++
++	if (!window || !window->frame)
++		return;
++
++	if (frame_get_flag(window->frame, FRAME_FLAG_BORDERLESS) == borderless)
++		return;
++
++	if (borderless)
++		frame_set_flag(window->frame, FRAME_FLAG_BORDERLESS);
++	else
++		frame_unset_flag(window->frame, FRAME_FLAG_BORDERLESS);
++
++	frame_resize_inside(window->frame, window->width, window->height);
++	weston_wm_window_configure(window);
++}
++
++static void
++toggle_borderless(struct weston_surface *surface)
++{
++	set_borderless(surface, !get_borderless(surface));
++}
++
+ static const struct weston_xwayland_client_interface shell_client = {
+ 	send_configure,
+ };
+@@ -3497,4 +3579,7 @@
+ 	get_class_name,
+ 	trigger_set_window_icon,
+ 	close_window,
++	get_borderless,
++	set_borderless,
++	toggle_borderless,
+ };
+Index: libweston/backend-rdp/rdpclip.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/libweston/backend-rdp/rdpclip.c b/libweston/backend-rdp/rdpclip.c
+--- a/libweston/backend-rdp/rdpclip.c	(revision 70dadf68e07a9386f58a2188535504f737b8b98e)
++++ b/libweston/backend-rdp/rdpclip.c	(revision 6320156bf1a62c85e3ede7b817b47cc276dad510)
+@@ -34,6 +34,7 @@
+ #include <fcntl.h>
+ #include <linux/input.h>
+ #include <stdio.h>
++#include <png.h>
+ 
+ #include "rdp.h"
+ 
+@@ -50,6 +51,14 @@
+ #define RDP_CLIPBOARD_FRAGMENT_START_OFFSET (53) //---------------------------------------------------------+                       |
+ #define RDP_CLIPBOARD_FRAGMENT_END_OFFSET (75) //-----------------------------------------------------------------------------------+
+ 
++/* 大文本粘贴优化：F_SETPIPE_SZ 兜底定义（Linux 2.6.35+ 支持） */
++#ifndef F_SETPIPE_SZ
++#define F_SETPIPE_SZ 1031
++#endif
++/* 大文本粘贴优化常量 */
++#define RDP_CLIPBOARD_PIPE_BUF_MIN_SIZE (256 * 1024) /* pipe 缓冲区最小值 256KB */
++#define RDP_CLIPBOARD_MAX_WRITE_PER_CALLBACK (64 * 1024) /* 每次事件循环回调最大写入 64KB */
++
+ /*
+  * https://docs.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format
+  *
+@@ -68,9 +77,15 @@
+ 	uint32_t format_id;
+ 	char *format_name;
+ 	char *mime_type;
++	uint32_t direction_flags;
+ 	pfn_process_data pfn;
+ };
+ 
++#define RDP_CLIPBOARD_FORMAT_TO_CLIENT   (1U << 0) /* Linux to Windows */
++#define RDP_CLIPBOARD_FORMAT_FROM_CLIENT (1U << 1) /* Windows to Linux */
++#define RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL \
++	(RDP_CLIPBOARD_FORMAT_TO_CLIENT | RDP_CLIPBOARD_FORMAT_FROM_CLIENT)
++
+ static bool
+ clipboard_process_text_utf8(struct rdp_clipboard_data_source *source, bool is_send);
+ 
+@@ -80,6 +95,9 @@
+ static bool
+ clipboard_process_bmp(struct rdp_clipboard_data_source *source , bool is_send);
+ 
++static bool
++clipboard_process_png(struct rdp_clipboard_data_source *source, bool is_send);
++
+ static bool
+ clipboard_process_html(struct rdp_clipboard_data_source *source, bool is_send);
+ 
+@@ -87,11 +105,12 @@
+  * For example, CF_UNICODETEXT to "UTF8_STRING" as well as "text/plain;charset=utf-8".
+  */
+ struct rdp_clipboard_supported_format clipboard_supported_formats[] = {
+-	{ CF_UNICODETEXT,  NULL,               "text/plain;charset=utf-8", clipboard_process_text_utf8 },
+-	{ CF_TEXT,         NULL,               "STRING",                   clipboard_process_text_raw  },
+-	{ CF_DIB,          NULL,               "image/bmp",                clipboard_process_bmp       },
+-	{ CF_PRIVATE_RTF,  "Rich Text Format", "text/rtf",                 clipboard_process_text_raw  },
+-	{ CF_PRIVATE_HTML, "HTML Format",      "text/html",                clipboard_process_html      },
++	{ CF_UNICODETEXT,  NULL,               "text/plain;charset=utf-8", RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL, clipboard_process_text_utf8 },
++	{ CF_TEXT,         NULL,               "STRING",                   RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL, clipboard_process_text_raw  },
++	{ CF_DIB,          NULL,               "image/bmp",                RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL, clipboard_process_bmp       },
++	{ CF_DIB,          NULL,               "image/png",                RDP_CLIPBOARD_FORMAT_FROM_CLIENT,   clipboard_process_png       },
++	{ CF_PRIVATE_RTF,  "Rich Text Format", "text/rtf",                 RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL, clipboard_process_text_raw  },
++	{ CF_PRIVATE_HTML, "HTML Format",      "text/html",                RDP_CLIPBOARD_FORMAT_BIDIRECTIONAL, clipboard_process_html      },
+ };
+ #define RDP_NUM_CLIPBOARD_FORMATS ARRAY_LENGTH(clipboard_supported_formats)
+ 
+@@ -580,6 +599,249 @@
+ 		   is_send ? "send" : "receive", (uint32_t)source->data_contents.size);
+ 
+ 	wl_array_release(&data_contents);
++
++	return false;
++}
++
++static uint32_t
++clipboard_read_u32(const void *data)
++{
++	uint32_t value;
++
++	memcpy(&value, data, sizeof(value));
++	return value;
++}
++
++static uint8_t
++clipboard_masked_channel_to_byte(uint32_t pixel, uint32_t mask)
++{
++	uint32_t shift = 0;
++	uint32_t max_value;
++	uint32_t value;
++
++	if (!mask)
++		return 0;
++
++	while ((mask & 1U) == 0) {
++		mask >>= 1;
++		shift++;
++	}
++
++	value = (pixel >> shift) & mask;
++	max_value = mask;
++	if (!max_value)
++		return 0;
++
++	return (uint8_t)((value * 255U + (max_value / 2U)) / max_value);
++}
++
++static void
++clipboard_png_write_data(png_structp png_ptr, png_bytep data, png_size_t length)
++{
++	struct wl_array *png_data = png_get_io_ptr(png_ptr);
++	void *dst;
++
++	if (!length)
++		return;
++
++	dst = wl_array_add(png_data, length);
++	if (!dst)
++		png_error(png_ptr, "failed to allocate png clipboard buffer");
++
++	memcpy(dst, data, length);
++}
++
++static void
++clipboard_png_flush_data(png_structp png_ptr)
++{
++	(void)png_ptr;
++}
++
++static bool
++clipboard_process_png(struct rdp_clipboard_data_source *source, bool is_send)
++{
++	freerdp_peer *client = (freerdp_peer *)source->context;
++	RdpPeerContext *ctx = (RdpPeerContext *)client->context;
++	struct rdp_backend *b = ctx->rdpBackend;
++	BITMAPINFOHEADER *bmih;
++	uint8_t *src;
++	uint8_t *bits;
++	uint8_t *row = NULL;
++	uint32_t red_mask = 0x00ff0000;
++	uint32_t green_mask = 0x0000ff00;
++	uint32_t blue_mask = 0x000000ff;
++	uint32_t width;
++	uint32_t height;
++	uint32_t bpp;
++	uint32_t header_size;
++	uint32_t mask_size = 0;
++	uint64_t stride;
++	uint64_t image_size;
++	size_t bits_offset;
++	size_t palette_size = 0;
++	size_t row_size;
++	struct wl_array data_contents;
++	png_structp png = NULL;
++	png_infop info = NULL;
++	bool top_down;
++
++	assert(!source->is_data_processed);
++
++	wl_array_init(&data_contents);
++
++	if (is_send)
++		goto error_return;
++
++	if (source->data_contents.size < sizeof(*bmih))
++		goto error_return;
++
++	src = source->data_contents.data;
++	bmih = (BITMAPINFOHEADER *)src;
++	header_size = bmih->biSize;
++	if (header_size < sizeof(*bmih) ||
++	    header_size > source->data_contents.size ||
++	    bmih->biPlanes != 1 ||
++	    bmih->biWidth <= 0 ||
++	    bmih->biHeight == 0 ||
++	    bmih->biHeight == INT32_MIN)
++		goto error_return;
++
++	bpp = bmih->biBitCount;
++	if (bpp != 24 && bpp != 32)
++		goto error_return;
++
++	width = bmih->biWidth;
++	height = bmih->biHeight < 0 ? -bmih->biHeight : bmih->biHeight;
++	top_down = bmih->biHeight < 0;
++
++	if (bmih->biCompression == BI_BITFIELDS) {
++		if (header_size == sizeof(*bmih)) {
++			if (source->data_contents.size < header_size + (sizeof(uint32_t) * 3))
++				goto error_return;
++
++			red_mask = clipboard_read_u32(src + header_size);
++			green_mask = clipboard_read_u32(src + header_size + sizeof(uint32_t));
++			blue_mask = clipboard_read_u32(src + header_size + (sizeof(uint32_t) * 2));
++			mask_size = sizeof(uint32_t) * 3;
++		} else if (header_size >= sizeof(*bmih) + (sizeof(uint32_t) * 3)) {
++			red_mask = clipboard_read_u32(src + sizeof(*bmih));
++			green_mask = clipboard_read_u32(src + sizeof(*bmih) + sizeof(uint32_t));
++			blue_mask = clipboard_read_u32(src + sizeof(*bmih) + (sizeof(uint32_t) * 2));
++		} else {
++			goto error_return;
++		}
++
++		if (!red_mask || !green_mask || !blue_mask)
++			goto error_return;
++	} else if (bmih->biCompression != BI_RGB) {
++		goto error_return;
++	}
++
++	if (bmih->biClrUsed > (UINT32_MAX / sizeof(RGBQUAD)))
++		goto error_return;
++	palette_size = bmih->biClrUsed * sizeof(RGBQUAD);
++	if (header_size > SIZE_MAX - mask_size ||
++	    header_size + mask_size > SIZE_MAX - palette_size)
++		goto error_return;
++	bits_offset = header_size + mask_size + palette_size;
++	if (bits_offset > source->data_contents.size)
++		goto error_return;
++
++	stride = DIB_WIDTH_BYTES((uint64_t)width * bpp);
++	if (height && stride > UINT64_MAX / height)
++		goto error_return;
++	image_size = stride * height;
++	if (image_size > SIZE_MAX ||
++	    bits_offset > SIZE_MAX - (size_t)image_size ||
++	    bits_offset + (size_t)image_size > source->data_contents.size)
++		goto error_return;
++
++	if (width > SIZE_MAX / 3)
++		goto error_return;
++	row_size = (size_t)width * 3;
++	row = malloc(row_size);
++	if (!row)
++		goto error_return;
++
++	png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
++	if (!png)
++		goto error_return;
++	info = png_create_info_struct(png);
++	if (!info)
++		goto error_return;
++
++	if (setjmp(png_jmpbuf(png)))
++		goto error_return;
++
++	png_set_write_fn(png, &data_contents, clipboard_png_write_data,
++			 clipboard_png_flush_data);
++	png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGB,
++		     PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
++		     PNG_FILTER_TYPE_DEFAULT);
++	png_write_info(png, info);
++
++	bits = src + bits_offset;
++	for (uint32_t y = 0; y < height; y++) {
++		uint32_t src_y = top_down ? y : (height - y - 1);
++		uint8_t *src_row = bits + (stride * src_y);
++
++		for (uint32_t x = 0; x < width; x++) {
++			uint32_t pixel;
++
++			if (bpp == 24) {
++				uint8_t *p = src_row + ((size_t)x * 3);
++
++				pixel = ((uint32_t)p[0]) |
++					((uint32_t)p[1] << 8) |
++					((uint32_t)p[2] << 16);
++			} else {
++				uint8_t *p = src_row + ((size_t)x * 4);
++
++				pixel = ((uint32_t)p[0]) |
++					((uint32_t)p[1] << 8) |
++					((uint32_t)p[2] << 16) |
++					((uint32_t)p[3] << 24);
++			}
++
++			row[((size_t)x * 3) + 0] = clipboard_masked_channel_to_byte(pixel, red_mask);
++			row[((size_t)x * 3) + 1] = clipboard_masked_channel_to_byte(pixel, green_mask);
++			row[((size_t)x * 3) + 2] = clipboard_masked_channel_to_byte(pixel, blue_mask);
++		}
++
++		png_write_row(png, row);
++	}
++
++	png_write_end(png, info);
++	if (data_contents.size > UINT32_MAX)
++		goto error_return;
++
++	png_destroy_write_struct(&png, &info);
++	free(row);
++	row = NULL;
++
++	wl_array_release(&source->data_contents);
++	source->data_contents = data_contents;
++	source->is_data_processed = true;
++	source->processed_data_start = source->data_contents.data;
++	source->processed_data_size = source->data_contents.size;
++	source->processed_data_is_send = is_send;
++
++	rdp_debug_clipboard_verbose(b, "RDP %s (%p:%s): receive (%d bytes)\n",
++				    __func__, source,
++				    clipboard_data_source_state_to_string(source),
++				    (uint32_t)source->data_contents.size);
++
++	return true;
++
++error_return:
++	if (png)
++		png_destroy_write_struct(&png, info ? &info : NULL);
++	free(row);
++	wl_array_release(&data_contents);
++	source->state = RDP_CLIPBOARD_SOURCE_FAILED;
++	weston_log("RDP %s FAILED (%p:%s): %s (%d bytes)\n",
++		   __func__, source, clipboard_data_source_state_to_string(source),
++		   is_send ? "send" : "receive", (uint32_t)source->data_contents.size);
+ 
+ 	return false;
+ }
+@@ -659,36 +921,33 @@
+ 	return "Unknown format";
+ }
+ 
++static bool
++clipboard_supported_format_matches_format_id_and_name(
++	const struct rdp_clipboard_supported_format *format,
++	UINT32 format_id, const char *format_name, uint32_t direction_flags)
++{
++	if ((format->direction_flags & direction_flags) == 0)
++		return false;
++
++	/* when our supported format table has format name, only format name must match,
++	   format id provided from client is ignored (but it may be saved by caller for future use.
++	   When our supported format table doesn't have format name, only format id must match,
++	   format name (if provided from client) is ignored */
++	return (format->format_name == NULL && format_id == format->format_id) ||
++	       (format->format_name && format_name && strcmp(format_name, format->format_name) == 0);
++}
++
+ /* find supported index in supported format table by format id from client */
+ static int
+-clipboard_find_supported_format_by_format_id(UINT32 format_id)
++clipboard_find_supported_format_by_format_id(UINT32 format_id, uint32_t direction_flags)
+ {
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < RDP_NUM_CLIPBOARD_FORMATS; i++) {
+ 		struct rdp_clipboard_supported_format *format = &clipboard_supported_formats[i];
+ 
+-		if (format_id == format->format_id)
+-			return i;
+-	}
+-	return -1;
+-}
+-
+-/* find supported index in supported format table by format id and name from client */
+-static int
+-clipboard_find_supported_format_by_format_id_and_name(UINT32 format_id, const char *format_name)
+-{
+-	unsigned int i;
+-
+-	for (i = 0; i < RDP_NUM_CLIPBOARD_FORMATS; i++) {
+-		struct rdp_clipboard_supported_format *format = &clipboard_supported_formats[i];
+-
+-		/* when our supported format table has format name, only format name must match,
+-		   format id provided from client is ignored (but it may be saved by caller for future use.
+-		   When our supported format table doesn't have format name, only format id must match,
+-		   format name (if provided from client) is ignored */
+-		if ((format->format_name == NULL && format_id == format->format_id) ||
+-		    (format->format_name && format_name && strcmp(format_name, format->format_name) == 0))
++		if ((format->direction_flags & direction_flags) &&
++		    format_id == format->format_id)
+ 			return i;
+ 	}
+ 	return -1;
+@@ -696,14 +955,15 @@
+ 
+ /* find supported index in supported format table by mime */
+ static int
+-clipboard_find_supported_format_by_mime_type(const char *mime_type)
++clipboard_find_supported_format_by_mime_type(const char *mime_type, uint32_t direction_flags)
+ {
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < RDP_NUM_CLIPBOARD_FORMATS; i++) {
+ 		struct rdp_clipboard_supported_format *format = &clipboard_supported_formats[i];
+ 
+-		if (strcmp(mime_type, format->mime_type) == 0)
++		if ((format->direction_flags & direction_flags) &&
++		    strcmp(mime_type, format->mime_type) == 0)
+ 			return i;
+ 	}
+ 	return -1;
+@@ -964,7 +1224,11 @@
+ 
+ 	assert_compositor_thread(b);
+ 
+-	assert(source->data_source_fd == fd);
++	/* 避免 WSLg 闪退：禁止断言失败退出 */
++	/* assert(source->data_source_fd == fd); */
++	if (source->data_source_fd != fd) {
++		goto fail;
++	}
+ 	/* this data source must be tracked as inflight */
+ 	assert(source == ctx->clipboard_inflight_client_data_source);
+ 
+@@ -1000,7 +1264,20 @@
+ 		clipboard_process_source(source, false);
+ 		data_to_write = source->processed_data_start;
+ 		data_size = source->processed_data_size;
++		/* 方案 A: 增大 pipe 缓冲区以减少大数据传输时的 EAGAIN 频率，
++		   避免 compositor 主线程频繁被唤醒又写不出去 */
++		if (data_size > 0) {
++			int desired_pipe_size = (int)data_size;
++			if (desired_pipe_size < RDP_CLIPBOARD_PIPE_BUF_MIN_SIZE)
++				desired_pipe_size = RDP_CLIPBOARD_PIPE_BUF_MIN_SIZE;
++			fcntl(source->data_source_fd, F_SETPIPE_SZ, desired_pipe_size);
++			rdp_debug_clipboard_verbose(b, "RDP %s (%p:%s) set pipe buffer to %d bytes for %zu bytes data\n",
++						    __func__, source,
++						    clipboard_data_source_state_to_string(source),
++						    desired_pipe_size, data_size);
++		}
+ 	}
++	size_t bytes_written_this_callback = 0; /* 方案 B: 跟踪本次回调已写入字节数 */
+ 	while (data_to_write && data_size) {
+ 		source->state = RDP_CLIPBOARD_SOURCE_TRANSFERING;
+ 		do {
+@@ -1025,6 +1302,7 @@
+ 			assert(data_size >= (size_t)size);
+ 			data_size -= size;
+ 			data_to_write = (char *)data_to_write + size;
++			bytes_written_this_callback += size;
+ 			rdp_debug_clipboard_verbose(b, "RDP %s (%p:%s) wrote %ld bytes, remaining %ld bytes\n",
+ 						    __func__, source,
+ 						    clipboard_data_source_state_to_string(source),
+@@ -1036,6 +1314,19 @@
+ 						    clipboard_data_source_state_to_string(source),
+ 						    source->data_contents.size);
+ 			}
++			/* 方案 B: 限制单次事件循环回调的写入量，让出 compositor 主线程
++			   处理渲染和输入事件，避免大数据传输时窗口卡死 */
++			if (data_size > 0 &&
++			    bytes_written_this_callback >= RDP_CLIPBOARD_MAX_WRITE_PER_CALLBACK) {
++				rdp_debug_clipboard_verbose(b, "RDP %s (%p:%s) yield after %zu bytes, remaining %zu bytes\n",
++							    __func__, source,
++							    clipboard_data_source_state_to_string(source),
++							    bytes_written_this_callback, data_size);
++				source->inflight_data_to_write = data_to_write;
++				source->inflight_data_size = data_size;
++				source->inflight_write_count++;
++				return 0;
++			}
+ 		}
+ 	}
+ 
+@@ -1125,7 +1416,8 @@
+ 		goto error_return_close_fd;
+ 	}
+ 
+-	index = clipboard_find_supported_format_by_mime_type(mime_type);
++	index = clipboard_find_supported_format_by_mime_type(mime_type,
++							    RDP_CLIPBOARD_FORMAT_FROM_CLIENT);
+ 	if (index >= 0 &&			/* check supported by this RDP bridge */
+ 	    source->client_format_id_table[index]) {	/* check supported by current data source from client */
+ 		ctx->clipboard_inflight_client_data_source = source;
+@@ -1178,10 +1470,12 @@
+ 				goto error_return_unref_source;
+ 		}
+ 	} else {
++		uint32_t format_id = index >= 0 ? source->client_format_id_table[index] : 0;
++
+ 		source->state = RDP_CLIPBOARD_SOURCE_FAILED;
+ 		weston_log("RDP %s (%p:%s) specified format \"%s\" index:%d formatId:%d is not supported by client\n",
+ 			   __func__, source, clipboard_data_source_state_to_string(source),
+-			   mime_type, index, source->client_format_id_table[index]);
++			   mime_type, index, format_id);
+ 		goto error_return_close_fd;
+ 	}
+ 
+@@ -1437,7 +1731,8 @@
+ 
+ 	/* check supported clipboard formats */
+ 	wl_array_for_each(mime_type, &selection_data_source->mime_types) {
+-		index = clipboard_find_supported_format_by_mime_type(*mime_type);
++		index = clipboard_find_supported_format_by_mime_type(*mime_type,
++								    RDP_CLIPBOARD_FORMAT_TO_CLIENT);
+ 		if (index >= 0) {
+ 			CLIPRDR_FORMAT *f = &format[num_supported_format];
+ 
+@@ -1556,30 +1851,48 @@
+ 
+ 	for (uint32_t i = 0; i < formatList->numFormats; i++) {
+ 		CLIPRDR_FORMAT *format = &formatList->formats[i];
+-		int index = clipboard_find_supported_format_by_format_id_and_name(format->formatId, format->formatName);
++		for (uint32_t index = 0; index < RDP_NUM_CLIPBOARD_FORMATS; index++) {
++			const struct rdp_clipboard_supported_format *supported_format =
++				&clipboard_supported_formats[index];
++			bool mime_type_exists = false;
+ 
+-		if (index >= 0) {
++			if (!clipboard_supported_format_matches_format_id_and_name(
++				    supported_format, format->formatId, format->formatName,
++				    RDP_CLIPBOARD_FORMAT_FROM_CLIENT))
++				continue;
++
+ 			/* save format id given from client, client can handle its own format id for private format. */
+ 			source->client_format_id_table[index] = format->formatId;
+-			s = strdup(clipboard_supported_formats[index].mime_type);
+-			if (s) {
+-				p = wl_array_add(&source->base.mime_types, sizeof *p);
+-				if (p) {
+-					rdp_debug_clipboard(b, "Client: %s (%p:%s) mine_type:\"%s\" index:%d formatId:%d\n",
+-							    __func__, source,
+-							    clipboard_data_source_state_to_string(source),
+-							    s, index, format->formatId);
+-					*p = s;
+-				} else {
+-					rdp_debug_clipboard(b, "Client: %s (%p:%s) wl_array_add failed\n",
+-							    __func__, source,
+-							    clipboard_data_source_state_to_string(source));
+-					free(s);
+-				}
+-			} else {
+-				rdp_debug_clipboard(b, "Client: %s (%p:%s) strdup failed\n",
+-						    __func__, source,
+-						    clipboard_data_source_state_to_string(source));
++
++			wl_array_for_each(p, &source->base.mime_types) {
++				if (strcmp(*p, supported_format->mime_type) == 0) {
++					mime_type_exists = true;
++					break;
++				}
++			}
++			if (mime_type_exists)
++				continue;
++
++			s = strdup(supported_format->mime_type);
++			if (!s) {
++				rdp_debug_clipboard(b, "Client: %s (%p:%s) strdup failed\n",
++						    __func__, source,
++						    clipboard_data_source_state_to_string(source));
++				continue;
++			}
++
++			p = wl_array_add(&source->base.mime_types, sizeof *p);
++			if (p) {
++				rdp_debug_clipboard(b, "Client: %s (%p:%s) mine_type:\"%s\" index:%d formatId:%d\n",
++						    __func__, source,
++						    clipboard_data_source_state_to_string(source),
++						    s, index, format->formatId);
++				*p = s;
++			} else {
++				rdp_debug_clipboard(b, "Client: %s (%p:%s) wl_array_add failed\n",
++						    __func__, source,
++						    clipboard_data_source_state_to_string(source));
++				free(s);
+ 			}
+ 		}
+ 	}
+@@ -1716,7 +2029,8 @@
+ 	assert_not_compositor_thread(b);
+ 
+ 	/* Make sure clients requested the format we knew */
+-	index = clipboard_find_supported_format_by_format_id(formatDataRequest->requestedFormatId);
++	index = clipboard_find_supported_format_by_format_id(formatDataRequest->requestedFormatId,
++							    RDP_CLIPBOARD_FORMAT_TO_CLIENT);
+ 	if (index < 0) {
+ 		weston_log("Client: %s client requests data format the server never reported in format list response. protocol error.\n", __func__);
+ 		goto error_return;
+Index: libweston/backend-rdp/meson.build
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/libweston/backend-rdp/meson.build b/libweston/backend-rdp/meson.build
+--- a/libweston/backend-rdp/meson.build	(revision 2fa6f3838882d6c483509fb7b0129e4048435d40)
++++ b/libweston/backend-rdp/meson.build	(revision 558019a01a393c42d8d6cff836e6aef26dc7c69b)
+@@ -28,6 +28,8 @@
+ 	endif
+ endif
+ 
++dep_libpng = dependency('libpng')
++
+ dep_rdpapplist = dependency('rdpapplist', version: '>= 2.0.0', required: false)
+ if dep_rdpapplist.found()
+ 	config_h.set('HAVE_FREERDP_RDPAPPLIST_H', '1')
+@@ -52,6 +54,7 @@
+ 	dep_frdp,
+ 	dep_frdp_server,
+ 	dep_wpr,
++	dep_libpng,
+ 	dep_rdpapplist,
+ ]
+ 
+Index: xwayland/selection.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/xwayland/selection.c b/xwayland/selection.c
+--- a/xwayland/selection.c	(revision 2fa6f3838882d6c483509fb7b0129e4048435d40)
++++ b/xwayland/selection.c	(revision 558019a01a393c42d8d6cff836e6aef26dc7c69b)
+@@ -340,17 +340,48 @@
+ 	xcb_flush(wm->conn);
+ }
+ 
++static int
++weston_wm_selection_has_mime_type(struct weston_wm *wm, const char *mime_type)
++{
++	struct weston_seat *seat = weston_wm_pick_seat(wm);
++	struct weston_data_source *source;
++	char **p;
++
++	if (!seat)
++		return 0;
++
++	source = seat->selection_data_source;
++	if (!source)
++		return 0;
++
++	wl_array_for_each(p, &source->mime_types) {
++		if (strcmp(*p, mime_type) == 0)
++			return 1;
++	}
++
++	return 0;
++}
++
+ static void
+ weston_wm_send_targets(struct weston_wm *wm)
+ {
+-	xcb_atom_t targets[] = {
+-		wm->atom.timestamp,
+-		wm->atom.targets,
+-		wm->atom.utf8_string,
++	xcb_atom_t targets[6];
++	uint32_t num_targets = 0;
++
++	targets[num_targets++] = wm->atom.timestamp;
++	targets[num_targets++] = wm->atom.targets;
++
++	if (weston_wm_selection_has_mime_type(wm, "image/png"))
++		targets[num_targets++] = wm->atom.image_png;
++	if (weston_wm_selection_has_mime_type(wm, "image/bmp"))
++		targets[num_targets++] = wm->atom.image_bmp;
++
++	if (weston_wm_selection_has_mime_type(wm, "text/plain;charset=utf-8")) {
++		targets[num_targets++] = wm->atom.utf8_string;
+ 		/* wm->atom.compound_text, */
+-		wm->atom.text,
++		targets[num_targets++] = wm->atom.text;
+ 		/* wm->atom.string */
+-	};
++	}
+ 
+ 	xcb_change_property(wm->conn,
+ 			    XCB_PROP_MODE_REPLACE,
+@@ -358,7 +389,7 @@
+ 			    wm->selection_request.property,
+ 			    XCB_ATOM_ATOM,
+ 			    32, /* format */
+-			    ARRAY_LENGTH(targets), targets);
++			    num_targets, targets);
+ 
+ 	weston_wm_send_selection_notify(wm, wm->selection_request.property);
+ }
+@@ -629,8 +660,12 @@
+ 		   selection_request->target == wm->atom.text) {
+ 		weston_wm_send_data(wm, wm->atom.utf8_string,
+ 				  "text/plain;charset=utf-8");
++	} else if (selection_request->target == wm->atom.image_png) {
++		weston_wm_send_data(wm, wm->atom.image_png, "image/png");
++	} else if (selection_request->target == wm->atom.image_bmp) {
++		weston_wm_send_data(wm, wm->atom.image_bmp, "image/bmp");
+ 	} else {
+-		weston_log("can only handle UTF8_STRING targets...\n");
++		weston_log("can only handle UTF8_STRING and image targets...\n");
+ 		weston_wm_send_selection_notify(wm, XCB_ATOM_NONE);
+ 	}
+ }
+Index: xwayland/xwayland.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/xwayland/xwayland.h b/xwayland/xwayland.h
+--- a/xwayland/xwayland.h	(revision 2fa6f3838882d6c483509fb7b0129e4048435d40)
++++ b/xwayland/xwayland.h	(revision 558019a01a393c42d8d6cff836e6aef26dc7c69b)
+@@ -152,6 +152,8 @@
+ 		xcb_atom_t		 window;
+ 		xcb_atom_t		 text_plain_utf8;
+ 		xcb_atom_t		 text_plain;
++		xcb_atom_t		 image_png;
++		xcb_atom_t		 image_bmp;
+ 		xcb_atom_t		 xdnd_selection;
+ 		xcb_atom_t		 xdnd_aware;
+ 		xcb_atom_t		 xdnd_enter;
+diff --git a/data/custom_icon/close_black.png b/data/custom_icon/close_black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ab9811a895ae4b275230d90c70f3d21baacaaa8
+GIT binary patch
+literal 260
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`J3U<-Ln;{0Ot{T^Sb@jYTYU8{
+zMxT%w9A+8Tl3#x=*v044HD$ibrh<3eZ+^dhQogZa$|dV#Grlita$dYgdg1qfyo!4S
+zR&~hnoHLRC=f1PyT9lciV@G1gi-Qk*g4xc!WMc4n;AHkJbB|_%w34}h+LqG{9gDZ}
+zTu3)IU(XQT>c_}oIKyx=|EXV@8<o$ncI=$-aewaXyGiXcFSFh_%b$0cVI?bDyIY}n
+zKz6NCNaMGH43T0+FPXRg?0<l6|Np<FZSNK!gAL>fW`;i%4T|BnihF<}44$rjF6*2U
+FngC)?X50V(
+
+diff --git a/data/custom_icon/close_white.png b/data/custom_icon/close_white.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..945548b64e39a8d6076e091e2ceeae996d8ecd23
+GIT binary patch
+literal 259
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`J3L(+Ln;{0Ot{E<Sb@hyyUejC
+zuyoU;lehXBZ?Il{-~7r)qif21mx#ie=joFRtbfMv1Z3Av4f?b{df~&syRi$me&bZM
+zF<jL-M{3s7{O<dO4O4>5PP9#Id#AL#O)U9N)!gmO0TPP0dfMER*&U9YFj*$_<jRF(
+zGnm{izpCcCuyy7+u`6i{WEqrs)6T8&U8BHvVRq(){d=1%8hrO%_G!+2z-MY=qXp#E
+zCWJIU%c$7$j6qB0tUvQUpws{Vw-DU>2gqOp`GJ`s|8SM!{c=?X5b$*Mb6Mw<&;$US
+C-e{fx
+
+diff --git a/data/custom_icon/maximize_black.png b/data/custom_icon/maximize_black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..acdd1de46cd09d1a8fb53af414a937148575cbf3
+GIT binary patch
+literal 230
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`vproLLn;{GOx(%KtSI1mP)K(N
+zlY5zP8LNZCR2B!;GEu)b7g7~I{7Z1#ebS?vMOx>QaQnR)-hv?Q<J%Y&Te^$iy<>UM
+zGy56enyuHPUb|=iozlQO-N_<B!|JiY(j}@7CUl#!Cv0v}c33I9x6$xfd;XVu<(w8z
+zlFo*A7}iB+Z@>53nTan(gqiQavMHa=S?=G&AhY9$N(0~XGxb2%{r{h}p?U|9!3J_B
+ZGsAD?2E|oRx>A5544$rjF6*2UngEu`R)7Ei
+
+diff --git a/data/custom_icon/maximize_white.png b/data/custom_icon/maximize_white.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e64cc39fa196b3622a4fb1e430810b6690aafff
+GIT binary patch
+literal 214
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`-JULvAr*{oCLQE$P~dSrs5pl~
+zZ&!=oy5NGw#no5hn|MD4IDL8G_?Vfie;Fg&=MUB9j$S8^N{I88y;`)CDQ8xPMpEJB
+zg!WjApVL`7+!FSD4{Mg45c_4B-+@B&dZy1yowr<*t7)%LS#t2)(@zoWE?Q1EFl^p>
+zFeWBryYT^To`igXPv<Uqu&Ta$=LdAn|Nm+%6LWzKHjuNJ8FZAA6l>mokOhh`c)I$z
+JtaD0e0s!rhQ0M>v
+
+diff --git a/data/custom_icon/minimize_black.png b/data/custom_icon/minimize_black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..cca8a88ccf47fccfb1aaa5110134d53912b29889
+GIT binary patch
+literal 140
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`j-D=#Ar*{o0#9->DDZISJ>!^Z
+zqP%0)eH-SmFBhE_^iO&wVKGOI!R~a!6R!tnuSZQV5xx`r;LOXo*^a-izQ3n^18Bzo
+k|ADi**?|l;kYUUWZ{su+pC<Yr1&T0uy85}Sb4q9e0HiE10RR91
+
+diff --git a/data/custom_icon/minimize_white.png b/data/custom_icon/minimize_white.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8061dec041175c5bb78baa1b33dd7fcf14475c8d
+GIT binary patch
+literal 140
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`j-D=#Ar*{o0#9->DDZH<o8&m>
+zj^n1D`!>vBUoJW==%4gV!eWjZgWYL|OI{DoUXN0+6uuMu;LOXo*^a-izQ3n^18Bzo
+k|4W&!-T^Y$K!!0hsMu;KF4;QU04T!X>FVdQ&MBb@0NuSX82|tP
+
+diff --git a/data/custom_icon/revert_black.png b/data/custom_icon/revert_black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9faa7a09edf9dfe002969c54ecbfdbe6492f2579
+GIT binary patch
+literal 328
+zc$@)90k{5%P)<h;3K|Lk000e1NJLTq000mG000mO1^@s6AM^iV0002}Nkl<ZcmcGM
+zI}U<C6h%QoX{jqP7Mj>-udaY!SdX|2w;&<F3d99iXknwJwJRXty@^a<m_&(@aPo%t
+zIWrJ?+K<=&1fJ*3Y};Ph629+`>W5aI07F4h6lY!64>Eb4-z>|TR1&2CLrXMdaUAP1
+z$ZMz%8A(IHogK$Hut2zev*)u4A;9n)=8dWexq<7tJH*y41gP|Zh9j?Km@mt6%qUYA
+z$hEJYI|=wbXf+Ju$w)d0IDl6PqA0p>O*#qqZIUF}a<D=OOw)WYiDQ;B$gi;T5wUd(
+zK^TU2{C!h2t`#h>bI_VbLI|+d(louIF;j42T}4BnYWS3U0RRC1|2am$DF6Tf21!Ig
+aR09BSDTpCmi1SGR0000<MNUMnLSTXrF@!h(
+
+diff --git a/data/custom_icon/revert_white.png b/data/custom_icon/revert_white.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5eb3fdbbabc82cb6d3c56824985509fd7f390160
+GIT binary patch
+literal 323
+zc$@)40lfZ+P)<h;3K|Lk000e1NJLTq000mG000mO1^@s6AM^iV0002^Nkl<ZcmcGM
+zK@Ng26hsBqF7*HeB+<l;?uC<y$M6bXLOp;BU6?={R<6AP;7mgrTbd{_l0R*k-@g7f
+z^+!K`{{vK2wG=|6wxpENd(qAcilWHty1ruK(N^2GV2U|>6;6Qf`x|6WaU6TL;4`Ld
+zC<DNqf#<HwjX3UfP==$?0Gw@wowtrTv?gU)?m4if0XW;3NtB$~qVIX$jJ+)luoK_@
+z4+8K$2o8ea$(|Yn-~uQQ!|;Y)#UMa;H#@bmYcv3t^q_|_`BDtQPn)JWqwj?VL{TJ>
+zT|k*Fz}HEV<nVi;0nDJpJH!`g2=EK@E*SvVgiqcJ00960QZh5?00006Nkl<Z0|4z>
+Va3PQiFhu|W002ovPDHLkV1in!hME8X
+
+diff --git a/data/custom_icon/window_black.png b/data/custom_icon/window_black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..dde74b7d9a24ee3897b181a124c88cf8feeeade8
+GIT binary patch
+literal 241
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`%RF5iLn;{8OxVbKSV6#*IjQxH
+z@OMpyPR&bc4B{*Ix^byEL>`D#_D*3`;VAD~_ib+PmnGT%E<b;L`CNIALQBE6YjHZl
+z8vVRkYt5HlIpvsLtLmtkdd^atPjjg?=Yt7N@e|q<+nWsUy_pkj>Cnbf!12R@P5O`f
+zoMRocC1<LGRPZiIJhAXV^?xbmGBs|_sBG`|wT}{dDkmiHe0nC7{AUsapQb&~q5uD{
+iHf5*=GT1;aW@gwI`cP48OHMvegu&C*&t;ucLK6U@w^(Ta
+
+diff --git a/data/custom_icon/window_white.png b/data/custom_icon/window_white.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1238a9949c3c14ce4c79bd8dd4a8d9d0a3930c3
+GIT binary patch
+literal 239
+zc%17D@N?(olHy`uVBq!ia0vp^0wB!61|;P_|4#%`OFUg1Ln;{8OxnnM$Uww}x#%IQ
+zMr`D?>k78BFBmy+WnEj4-ngOdsjS4og72L%&;P4j3O+aKeTmgii=02-I9F_)cOa7c
+zw0HBhTcYieCt1I<bDpsD*Ie2>DVl%51|{A#X}?q!OfgD45Xo$7+u+n)yzYWB?=(U8
+zo*lC!9&ct3h?vM0W?U=O@G<Ve>L(YO6)Ge?#`k{z*Z2GX^p21BqMSJ9%Q+-IWoKac
+l|Nq%t?_{8R*+A}PX3+N7rTBLCNmrl<gQu&X%Q~loCIHOIUta(K
+
